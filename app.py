@@ -1,131 +1,102 @@
 import os
+from flask import Flask, request, jsonify
 from PyPDF2 import PdfReader
+from docx import Document
+from pptx import Presentation
 import chromadb
 from chromadb.utils import embedding_functions
+from werkzeug.utils import secure_filename
 
-# 1. Setup Embedding Function (Uses sentence-transformers locally)
-# This replaces manual encoding in a loop for better performance
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = './temp_uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# --- 1. ChromaDB Setup ---
 ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-
-# 2. Initialize Persistent ChromaDB Client (Modern API)
-# This saves data to the 'chroma_data' folder in your directory
 chroma_client = chromadb.PersistentClient(path="./chroma_data")
+collection = chroma_client.get_or_create_collection(name="microservice_docs", embedding_function=ef)
 
-# 3. Create or get collection
-# We pass the embedding function here so it's automatic
-collection = chroma_client.get_or_create_collection(
-    name="pdf_files", 
-    embedding_function=ef
-)
-
-# ------------------------------
-# 4. Extract PDF text
-# ------------------------------
-def extract_pdf_text(pdf_path):
-    if not os.path.exists(pdf_path):
-        print(f"Error: File {pdf_path} not found.")
+# --- 2. Extraction Helpers ---
+def extract_text(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == '.pdf':
+            reader = PdfReader(file_path)
+            return "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+        elif ext == '.docx':
+            return "\n".join([para.text for para in Document(file_path).paragraphs])
+        elif ext == '.pptx':
+            prs = Presentation(file_path)
+            return "\n".join([shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")])
+        elif ext == '.txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
         return None
-    
-    reader = PdfReader(pdf_path)
-    full_text = ""
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            full_text += text + "\n"
-    return full_text
+    except Exception as e:
+        print(f"Extraction error: {e}")
+        return None
 
-# ------------------------------
-# 5. Chunk text
-# ------------------------------
-def chunk_text(text, chunk_size=300, overlap=50):
+def chunk_text(text, chunk_size=150, overlap=30):
     words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start += chunk_size - overlap
-    return chunks
+    return [" ".join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size - overlap)]
 
-# ------------------------------
-# 6. Add PDF to ChromaDB
-# ------------------------------
-def add_pdf_to_chroma(pdf_path, description=""):
-    file_name = os.path.basename(pdf_path)
-    text = extract_pdf_text(pdf_path)
+# --- 3. API Endpoints ---
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
     
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    # Save temp file
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(file_path)
+
+    # Process
+    text = extract_text(file_path)
     if not text:
-        return
+        os.remove(file_path)
+        return jsonify({"error": "Could not extract text or unsupported format"}), 400
 
     chunks = chunk_text(text)
+    ids = [f"{filename}_{i}" for i in range(len(chunks))]
+    metadatas = [{"file_name": filename} for _ in range(len(chunks))]
 
-    documents = []
-    metadatas = []
-    ids = []
-
-    for i, chunk in enumerate(chunks):
-        documents.append(chunk)
-        metadatas.append({
-            "file_name": file_name,
-            "description": description
-        })
-        ids.append(f"{file_name}_chunk{i+1}")
-
-    # Note: We no longer need to pass 'embeddings' manually!
-    # The 'ef' we defined in Step 3 handles it automatically.
-    collection.add(
-        documents=documents,
-        metadatas=metadatas,
-        ids=ids
-    )
-    print(f"[+] Added {len(chunks)} chunks for {file_name}.")
-
-# ------------------------------
-# 7. Search function
-# ------------------------------
-def search_pdf(query, top_k=1):
-    # Just pass the text string; Chroma encodes it using 'ef' automatically
-    results = collection.query(
-        query_texts=[query],
-        n_results=top_k
-    )
-
-    output = []
-    seen = set()
-    # Results are returned in lists of lists
-    for doc, meta in zip(results['documents'][0], results['metadatas'][0]):
-        if meta['file_name'] not in seen:
-            output.append({
-                "file_name": meta['file_name'],
-                "description": meta.get('description', ''),
-                "snippet": doc
-            })
-            seen.add(meta['file_name'])
-    return output
-
-# ------------------------------
-# Example usage
-# ------------------------------
-if __name__ == "__main__":
-    # Ensure you have a file named 'example.pdf' in the same folder
-    pdf_to_load1 = "example_1.pdf"
-    pdf_to_load2 = "example_2.pdf"
-
+    collection.add(documents=chunks, metadatas=metadatas, ids=ids)
     
-    if os.path.exists(pdf_to_load1):
-        add_pdf_to_chroma(pdf_to_load1, description="AI in healthcare report")
-        add_pdf_to_chroma(pdf_to_load2, description="NASA")
+    # Cleanup temp file
+    os.remove(file_path)
+    
+    return jsonify({
+        "message": f"Successfully indexed {filename}",
+        "chunks": len(chunks)
+    }), 200
 
-        
-        # Search
-        query = "NASA"
-        print(f"\nSearching for: '{query}'\n" + "="*50)
-        
-        search_results = search_pdf(query)
-        for r in search_results:
-            print(f"Source: {r['file_name']} ({r['description']})")
-            print(f"Snippet: {r['snippet'][:200]}...") # Print first 200 chars
-            print("-" * 50)
-    else:
-        print(f"Please place a file named '{pdf_to_load1}' in the directory to test.")
+@app.route('/search', methods=['POST'])
+def search():
+    data = request.json
+    query = data.get('query')
+    top_k = data.get('top_k', 3)
+
+    if not query:
+        return jsonify({"error": "No query provided"}), 400
+
+    results = collection.query(query_texts=[query], n_results=top_k)
+
+    # Reformat for the main app to consume easily
+    formatted_results = []
+    for i in range(len(results['documents'][0])):
+        formatted_results.append({
+            "content": results['documents'][0][i],
+            "file_name": results['metadatas'][0][i]['file_name'],
+            "distance": results['distances'][0][i]
+        })
+
+    return jsonify({"results": formatted_results}), 200
+
+if __name__ == '__main__':
+    app.run(port=5001, debug=True)
